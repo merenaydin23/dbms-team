@@ -2,6 +2,7 @@ import time
 import random
 import json
 import re
+import requests
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
@@ -12,239 +13,420 @@ from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
 import pprint
 
+# ------------------------------------------------------------------
+# ------------------ Yardımcı: URL erişim / HEAD kontrol --------------
+# ------------------------------------------------------------------
+def url_exists_head(url, timeout=6):
+    """HEAD isteği ile URL'nin erişilebilir olup olmadığını kontrol et."""
+    try:
+        r = requests.head(url, allow_redirects=True, timeout=timeout)
+        if r.status_code == 200:
+            # Bazı sunucular content-type vermez; 200 yeterli kabul edilebilir
+            return True
+    except Exception:
+        pass
+    return False
 
-# ------------------------------------------------------------------------------------------
-# -------------------------- PLATFORM PDF ALMA FONKSİYONLARI -------------------------------
-# ------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------
+# ------------------ Wiley yardımcı fonksiyonlar --------------------
+# ------------------------------------------------------------------
+def extract_doi_from_wiley(url):
+    """Wiley URL'den DOI kısmını çıkarmaya çalışır."""
+    try:
+        m = re.search(r'/doi/(?:abs|full|pdf|epdf)/(.+)', url)
+        if m:
+            return m.group(1)
+        m = re.search(r'/doi/(.+)', url)
+        if m:
+            return m.group(1)
+    except:
+        pass
+    return None
+
+def get_wiley_candidates_from_doi(doi):
+    """DOI'den olası Wiley PDF URL'lerini üretir."""
+    return [
+        f"https://onlinelibrary.wiley.com/doi/pdf/{doi}",
+        f"https://onlinelibrary.wiley.com/doi/epdf/{doi}",
+        f"https://onlinelibrary.wiley.com/doi/pdfdirect/{doi}"
+    ]
+
+# ------------------------------------------------------------------
+# ------------------ Platform spesifik PDF çekiciler ----------------
+# ------------------------------------------------------------------
 
 def get_pdf_from_dergipark(driver, url):
     try:
         driver.get(url)
-        wait = WebDriverWait(driver, 10)
-        wait.until(EC.presence_of_element_located((By.CLASS_NAME, 'kt-nav__link-text')))
+        WebDriverWait(driver, 8).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         pdf_anchor = soup.find('a', class_='kt-nav__link', href=re.compile(r'/download/article-file/'))
-        if pdf_anchor:
+        if pdf_anchor and pdf_anchor.get('href'):
             return "https://dergipark.org.tr" + pdf_anchor['href']
-    except:
+    except Exception:
         pass
-    return "Dergipark PDF Yok"
-
+    return None
 
 def get_pdf_from_mdpi(driver, url):
-    driver.get(url)
-    time.sleep(1)
-    soup = BeautifulSoup(driver.page_source, "html.parser")
-    pdf = soup.find("a", href=lambda h: h and "pdf" in h)
-    if pdf:
-        return "https://www.mdpi.com" + pdf["href"]
-    return "MDPI PDF Yok"
-
+    try:
+        driver.get(url)
+        WebDriverWait(driver, 6).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        # MDPI often uses /article/view/.../pdf or links containing "/pdf"
+        a = soup.find("a", href=lambda h: h and "/pdf" in h)
+        if a and a.get('href'):
+            href = a['href']
+            if href.startswith('/'):
+                return "https://www.mdpi.com" + href
+            return href
+    except:
+        pass
+    # fallback guess
+    if "mdpi.com" in url and not url.endswith(".pdf"):
+        return url + ".pdf"
+    return None
 
 def get_pdf_from_ieee(driver, url):
-    driver.get(url)
-    time.sleep(2)
     try:
-        btn = driver.find_element(By.ID, "pdf-link")
-        return btn.get_attribute("href")
+        driver.get(url)
+        WebDriverWait(driver, 6).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
+        # Many IEEE pages don't show PDF href in initial HTML; try to construct from document id
+        m = re.search(r'document/(\d+)', url)
+        if m:
+            arnumber = m.group(1)
+            candidate = f"https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber={arnumber}"
+            if url_exists_head(candidate):
+                return candidate
+        # try to find <a> with pdf in page
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        a = soup.find("a", href=lambda h: h and "pdf" in h)
+        if a and a.get('href'):
+            return a['href']
     except:
-        return "IEEE PDF Yok"
-
+        pass
+    return None
 
 def get_pdf_from_wiley(driver, url):
-    driver.get(url)
-    soup = BeautifulSoup(driver.page_source, "html.parser")
-    pdf = soup.find("a", {"class": "pdf-download"})
-    if pdf and pdf.get("href"):
-        return "https://onlinelibrary.wiley.com" + pdf["href"]
-    return "Wiley PDF Yok"
+    try:
+        driver.get(url)
+        # wait a bit for JS to render
+        WebDriverWait(driver, 6).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
+        # 1 - try to find visible 'PDF' link/button via Selenium
+        try:
+            # bazen link text 'PDF' olabiliyor
+            pdf_btn = driver.find_element(By.LINK_TEXT, "PDF")
+            href = pdf_btn.get_attribute("href")
+            if href:
+                return href
+        except:
+            pass
 
+        # 2 - parse HTML for elements with pdf-download or epdf
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        # common class used
+        a = soup.find("a", class_=lambda c: c and "pdf" in c.lower())
+        if a and a.get('href'):
+            href = a['href']
+            if href.startswith('/'):
+                return "https://onlinelibrary.wiley.com" + href
+            return href
+        # find any link containing /doi/epdf or /doi/pdf
+        for a in soup.find_all("a", href=True):
+            if "/doi/epdf" in a['href'] or "/doi/pdf" in a['href'] or "epdf" in a['href']:
+                href = a['href']
+                if href.startswith('/'):
+                    return "https://onlinelibrary.wiley.com" + href
+                return href
+
+        # 3 - DOI'den candidate üret ve HEAD ile test et
+        doi = extract_doi_from_wiley(url)
+        if doi:
+            for cand in get_wiley_candidates_from_doi(doi):
+                if url_exists_head(cand):
+                    return cand
+    except:
+        pass
+    return None
 
 def get_pdf_from_sciencedirect(driver, url):
-    driver.get(url)
-    soup = BeautifulSoup(driver.page_source, "html.parser")
-    pdf = soup.find("a", {"id": "pdfDownload"})
-    if pdf:
-        return "https://www.sciencedirect.com" + pdf["href"]
-    return "ScienceDirect PDF Yok"
-
+    try:
+        driver.get(url)
+        WebDriverWait(driver, 6).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
+        # Try to find direct pdf link element by known ids/classes
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        # common patterns
+        candidates = []
+        a = soup.find("a", id=lambda i: i and "pdf" in i.lower())
+        if a and a.get('href'):
+            candidates.append(a['href'])
+        a = soup.find("a", href=lambda h: h and "pdf" in h)
+        if a and a.get('href'):
+            candidates.append(a['href'])
+        # try stamp-like URL (Elsevier sometimes uses /science/article/pii/ -> has PDF path)
+        if candidates:
+            for href in candidates:
+                if href.startswith('/'):
+                    full = "https://www.sciencedirect.com" + href
+                else:
+                    full = href
+                if url_exists_head(full):
+                    return full
+        # fallback: try appending /pdf
+        if "/pii/" in url and not url.endswith(".pdf"):
+            cand = url + "/pdf"
+            if url_exists_head(cand):
+                return cand
+    except:
+        pass
+    return None
 
 def get_pdf_from_springer(driver, url):
-    driver.get(url)
-    soup = BeautifulSoup(driver.page_source, "html.parser")
-    pdf = soup.find("a", href=lambda h: h and "pdf" in h)
-    if pdf:
-        return "https://link.springer.com" + pdf["href"]
-    return "Springer PDF Yok"
+    try:
+        driver.get(url)
+        WebDriverWait(driver, 6).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        a = soup.find("a", href=lambda h: h and "/content/pdf" in h or (h and h.endswith(".pdf")))
+        if a and a.get('href'):
+            href = a['href']
+            if href.startswith('/'):
+                return "https://link.springer.com" + href
+            return href
+        # fallback guess
+        if "/article/" in url:
+            cand = url.replace("/article/", "/content/pdf/") + ".pdf"
+            if url_exists_head(cand):
+                return cand
+    except:
+        pass
+    return None
 
+# For platforms where we decided "login required" or unsupported, return None
+def get_pdf_from_researchgate(driver, url): return None
+def get_pdf_from_hrcak(driver, url): return None
+def get_pdf_from_sagepub(driver, url): return None
+def get_pdf_from_euroasiajournal(driver, url): return None
+def get_pdf_from_elibrary(driver, url): return None
+def get_pdf_from_proquest(driver, url): return None
+def get_pdf_from_ssrn(driver, url): return None
+def get_pdf_from_academia(driver, url): return None
+def get_pdf_from_archive(driver, url): return None
 
-def get_pdf_from_researchgate(driver, url):
-    driver.get(url)
-    soup = BeautifulSoup(driver.page_source, "html.parser")
-    pdf = soup.find("a", href=lambda h: h and ".pdf" in h)
-    if pdf:
-        return pdf["href"]
-    return "ResearchGate PDF Yok (Login gerekebilir)"
+# ------------------------------------------------------------------
+# ------------------ Platform dispatcher + guesser ------------------
+# ------------------------------------------------------------------
+def guess_pdf_url_by_pattern(url):
+    """Genel tahmin kuralları (platform bazlı kısa yollar)."""
+    u = url.lower()
+    # Wiley
+    if "onlinelibrary.wiley.com/doi/" in u:
+        doi = extract_doi_from_wiley(url)
+        if doi:
+            for cand in get_wiley_candidates_from_doi(doi):
+                if url_exists_head(cand):
+                    return cand
+            # return first candidate if none responds (still better than None)
+            return get_wiley_candidates_from_doi(doi)[0]
 
+    # IEEE
+    m = re.search(r'document/(\d+)', u)
+    if m:
+        ar = m.group(1)
+        cand = f"https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber={ar}"
+        if url_exists_head(cand):
+            return cand
+        return cand
 
-# ------------------------------------------------------------------------------------------
-# ------------------------- URL'DEN PLATFORM PDF YÖNLENDİRİCİ ------------------------------
-# ------------------------------------------------------------------------------------------
+    # Springer
+    if "link.springer.com/article" in u:
+        cand = url.replace("/article/", "/content/pdf/") + ".pdf"
+        if url_exists_head(cand):
+            return cand
+        return cand
+
+    # ScienceDirect
+    if "sciencedirect.com" in u:
+        if "/pii/" in u:
+            cand = url + "/pdf"
+            if url_exists_head(cand):
+                return cand
+            return cand
+
+    # MDPI
+    if "mdpi.com" in u:
+        return url + ".pdf"
+
+    # Generic: try to find any direct .pdf link on page (requests)
+    try:
+        r = requests.get(url, timeout=6)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, 'html.parser')
+            a = soup.find("a", href=lambda h: h and h.lower().endswith(".pdf"))
+            if a and a.get('href'):
+                href = a['href']
+                if href.startswith('/'):
+                    base = re.match(r'(https?://[^/]+)', url).group(1)
+                    return base + href
+                return href
+    except:
+        pass
+
+    return None
 
 def get_pdf_by_platform(driver, url):
-    if "dergipark.org.tr" in url:
-        return get_pdf_from_dergipark(driver, url)
-    if "mdpi.com" in url:
-        return get_pdf_from_mdpi(driver, url)
-    if "ieeexplore.ieee.org" in url:
-        return get_pdf_from_ieee(driver, url)
-    if "onlinelibrary.wiley.com" in url:
-        return get_pdf_from_wiley(driver, url)
-    if "sciencedirect.com" in url:
-        return get_pdf_from_sciencedirect(driver, url)
-    if "link.springer.com" in url:
-        return get_pdf_from_springer(driver, url)
-    if "researchgate.net" in url:
-        return get_pdf_from_researchgate(driver, url)
+    """Önce platform spesifik gerçek PDF arar, yoksa tahmin dener."""
+    if not url or url == "Kaynak Yok":
+        return None
 
-    return "Platform desteklenmiyor"
+    # platform-specific attempts
+    try:
+        if "dergipark.org.tr" in url:
+            r = get_pdf_from_dergipark(driver, url)
+            if r: return r
 
+        if "mdpi.com" in url:
+            r = get_pdf_from_mdpi(driver, url)
+            if r: return r
 
-# ------------------------------------------------------------------------------------------
-# ------------------------------ GOOGLE SCHOLAR SCRAPER ------------------------------------
-# ------------------------------------------------------------------------------------------
+        if "ieeexplore.ieee.org" in url:
+            r = get_pdf_from_ieee(driver, url)
+            if r: return r
 
+        if "onlinelibrary.wiley.com" in url:
+            r = get_pdf_from_wiley(driver, url)
+            if r: return r
+
+        if "sciencedirect.com" in url:
+            r = get_pdf_from_sciencedirect(driver, url)
+            if r: return r
+
+        if "link.springer.com" in url:
+            r = get_pdf_from_springer(driver, url)
+            if r: return r
+
+        # login-required or unsupported platforms -> return None (we'll fallback to guesser)
+        # researchgate, proquest, academia, ssrn, etc return None above
+
+    except Exception:
+        pass
+
+    # fallback: pattern-based guess + quick test
+    guessed = guess_pdf_url_by_pattern(url)
+    return guessed
+
+# ------------------------------------------------------------------
+# ------------------ Google Scholar scraping functions --------------
+# ------------------------------------------------------------------
 def get_author_profile_url(driver, author_name):
     author_name_formatted = author_name.replace(" ", "+")
     search_url = f'https://scholar.google.com/scholar?hl=tr&q={author_name_formatted}'
-    print(f"\n'{author_name}' için yazar profili aranıyor...")
     driver.get(search_url)
-    wait = WebDriverWait(driver, 10)
     try:
-        profile_link_element = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'h4.gs_rt2 a')))
-        relative_link = profile_link_element.get_attribute('href')
-        print("Yazar profili bulundu.")
-        return relative_link
-    except:
-        print("Arama sonuçlarında bir kullanıcı profili bulunamadı.")
+        profile_link_element = WebDriverWait(driver, 8).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, 'h4.gs_rt2 a'))
+        )
+        return profile_link_element.get_attribute('href')
+    except Exception:
         return None
 
-
 def get_all_article_links_from_profile(driver, profile_url):
-    print(f"Profil sayfasına gidiliyor: {profile_url}")
     driver.get(profile_url)
-    wait = WebDriverWait(driver, 10)
     try:
-        show_more_button = wait.until(EC.element_to_be_clickable((By.ID, 'gsc_bpf_more')))
-        print("'Daha fazla göster' ile makaleler yükleniyor...")
+        show_more_button = WebDriverWait(driver, 6).until(
+            EC.element_to_be_clickable((By.ID, 'gsc_bpf_more'))
+        )
         while show_more_button.is_enabled():
-            show_more_button.click()
-            time.sleep(1.5)
-            show_more_button = driver.find_element(By.ID, 'gsc_bpf_more')
+            try:
+                show_more_button.click()
+                time.sleep(0.8)
+                show_more_button = driver.find_element(By.ID, 'gsc_bpf_more')
+            except:
+                break
     except:
-        print("Tüm makaleler zaten yüklenmiş.")
-
-    page_source = driver.page_source
-    soup = BeautifulSoup(page_source, 'html.parser')
-    article_links = []
-
+        pass
+    soup = BeautifulSoup(driver.page_source, 'html.parser')
+    links = []
     for row in soup.find_all('tr', class_='gsc_a_tr'):
-        link_element = row.find('a', class_='gsc_a_at')
-        if link_element and link_element.has_attr('href'):
-            full_link = "https://scholar.google.com" + link_element['href']
-            article_links.append(full_link)
-
-    print(f"Toplam {len(article_links)} makale bulundu.")
-    return article_links
-
+        a = row.find('a', class_='gsc_a_at')
+        if a and a.has_attr('href'):
+            links.append("https://scholar.google.com" + a['href'])
+    return links
 
 def scrape_article_details(driver, article_url):
     driver.get(article_url)
-    wait = WebDriverWait(driver, 10)
-
     try:
-        wait.until(EC.presence_of_element_located((By.ID, 'gsc_oci_table')))
+        WebDriverWait(driver, 6).until(EC.presence_of_element_located((By.ID, 'gsc_oci_table')))
     except:
-        print(f"→ Detay sayfası yüklenemedi: {article_url}")
-        return None
-
+        pass
     soup = BeautifulSoup(driver.page_source, 'html.parser')
     details = {}
-
     title_element = soup.find('a', class_='gsc_oci_title_link')
-    details['title'] = title_element.text if title_element else "Başlık Yok"
-    details['source_url'] = title_element['href'] if title_element else "Kaynak Yok"
-
-    # PDF TARAYICI EKLENDİ
+    details['title'] = title_element.text.strip() if title_element else ""
+    details['source_url'] = title_element['href'] if title_element and title_element.has_attr('href') else ""
+    # find pdf (platform-specific + guess)
     details['pdf_url'] = get_pdf_by_platform(driver, details['source_url'])
-
+    # other metadata
     info_table = soup.find('div', id='gsc_oci_table')
     if info_table:
         for row in info_table.find_all('div', class_='gs_scl'):
-            field = row.find('div', class_='gsc_oci_field')
-            value = row.find('div', class_='gsc_oci_value')
-            if field and value:
-                field_key = field.text.strip().lower().replace(' ', '_')
-                details[field_key] = value.text.strip()
-
+            fld = row.find('div', class_='gsc_oci_field')
+            val = row.find('div', class_='gsc_oci_value')
+            if fld and val:
+                key = fld.text.strip().lower().replace(' ', '_')
+                details[key] = val.get_text(strip=True)
     return details
-
 
 def save_to_json(data, filename_prefix):
     filename = f"{filename_prefix.replace(' ', '_')}_detailed_articles.json"
     with open(filename, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
-    print(f"\nVeriler kaydedildi → {filename}")
+    print(f"Kaydedildi → {filename}")
 
-
-# ------------------------------------------------------------------------------------------
-# ------------------------------------ MAIN -------------------------------------------------
-# ------------------------------------------------------------------------------------------
-
+# ------------------------------------------------------------------
+# -------------------------------- MAIN --------------------------------
+# ------------------------------------------------------------------
 def main():
-    author_name = input("Makalelerini çekmek istediğiniz yazarın adını girin: ")
+    author_name = input("Makalelerini çekmek istediğiniz yazarın adını girin: ").strip()
     if not author_name:
-        print("Yazar adı boş bırakılamaz.")
+        print("Yazar adı boş.")
         return
 
-    driver = None
+    options = Options()
+    # options.add_argument('--headless')  # isteğe bağlı: görünmeden çalıştırmak için aç
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)')
+
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
+
     try:
-        options = Options()
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-gpu')
-        options.add_argument('--disable-dev-shm-usage')
-
-        print("Selenium başlatılıyor...")
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
-
         profile_url = get_author_profile_url(driver, author_name)
         if not profile_url:
+            print("Yazar profili bulunamadı.")
             return
 
         article_links = get_all_article_links_from_profile(driver, profile_url)
-        all_articles_details = []
+        print(f"{len(article_links)} makale bulundu. Çekiliyor...")
 
-        print("\nMakaleler çekiliyor...\n")
-
+        results = []
         for i, link in enumerate(article_links, 1):
-            print(f"[{i}/{len(article_links)}] → {link}")
+            print(f"[{i}/{len(article_links)}] {link}")
             details = scrape_article_details(driver, link)
-            if details:
-                all_articles_details.append(details)
-            time.sleep(random.uniform(2, 4))
+            # if pdf_url is None, set to "PDF Yok"
+            if not details.get('pdf_url'):
+                details['pdf_url'] = "PDF Yok"
+            results.append(details)
+            time.sleep(random.uniform(1.5, 3.5))
 
-        if all_articles_details:
-            pprint.pprint(all_articles_details[0])
-            save_to_json(all_articles_details, author_name)
+        if results:
+            pprint.pprint(results[0])
+            save_to_json(results, author_name)
 
     except Exception as e:
-        print(f"Hata: {e}")
-
+        print("Hata:", e)
     finally:
-        if driver:
-            driver.quit()
-
+        driver.quit()
 
 if __name__ == '__main__':
     main()
