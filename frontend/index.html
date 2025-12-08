@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Akademik Makale Toplayıcı</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="container">
+    <header>
+      <h1>Akademik Makale Toplayıcı</h1>
+      <p>Yazar adını girin, backend Google Scholar'dan makaleleri çekip kaydetsin.</p>
+    </header>
+
+    <section class="card">
+      <form id="scrape-form">
+        <label for="author">Yazar adı</label>
+        <input id="author" name="author" placeholder="Örn: John Doe" required />
+        <button type="submit">Makaleleri Çek ve Kaydet</button>
+      </form>
+      <div id="status" class="status"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <h2>Son Makaleler</h2>
+        <button id="refresh">Listeyi Yenile</button>
+      </div>
+      <div class="table-wrapper">
+        <table>
+          <thead>
+            <tr>
+              <th>Başlık</th>
+              <th>Yazarlar</th>
+              <th>Yıl</th>
+              <th>Yayın Tarihi</th>
+              <th>Dergi</th>
+              <th>Cilt/Sayı</th>
+              <th>Sayfalar</th>
+              <th>Yayıncı</th>
+              <th>Atıf</th>
+              <th>Kaynak</th>
+              <th>PDF</th>
+            </tr>
+          </thead>
+          <tbody id="articles-body">
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="script.js"></script>
+</body>
+</html>
+
